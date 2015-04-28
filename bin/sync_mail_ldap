@@ -1,24 +1,19 @@
 #!/usr/bin/env ruby
 # encoding: UTF-8
 
-require 'thor'
-require 'ruby-plsql'
-require 'redis'
-require 'net-ldap'
 require 'awesome_print'
-require 'digest/sha1'
 require 'json'
+require 'net-ldap'
 require 'pry'
-require 'active_support/core_ext'
+require 'redis'
+require 'thor'
+
+require_relative "../lib/idm"
 
 class SyncMailLDAP < Thor
 
   LDAP_CHECKSUM_SET = 'mail:s_checksum_ldap_mail'
-  LDAP_MAIL_SET      = 'mail:s_mail_ldap_mail'
   UMT_CHECKSUM_SET  = 'mail:s_checksum_umt'
-  UMT_MAIL_SET       = 'mail:s_mail_umt'
-  UMT_ACCOUNT_BY_MAIL_HASH  = 'mail:h_accounts_by_mail'
-  UMT_ACCOUNT_BY_CHECKSUM_HASH  = 'mail:h_accounts_by_checksum'
 
   desc 'new','add all missing accounts to the ldap'
   def new
@@ -27,15 +22,15 @@ class SyncMailLDAP < Thor
     fetch_ldap
 
     counter = 0
-    missing_entries.each do |mail|
+    missing_entries.map do |checksum|
       counter += 1
-      puts "#{counter}: #{mail}"
-      write_new_entry mail
+      puts "#{counter}: #{checksum}"
+      write_new_entry checksum
     end
   end
 
-  desc "update","update ldap accounts"
-  def update
+  desc "delete","deletes obsolete entries"
+  def delete
     cleanup_redis_db
     fetch_idm
     fetch_ldap
@@ -47,8 +42,8 @@ class SyncMailLDAP < Thor
     end
 
     counter = 0
-    update_candidates.each do |checksum|
-      write_update_entry checksum
+    obsolete_entries.map do |checksum|
+      delete_obsolete_entry checksum
       counter += 1
     end
     puts "#{counter} Eintraege aktualisiert"
@@ -59,61 +54,32 @@ private
     @redis ||= Redis.new
   end
 
-  def connect_idm
-    plsql.connection = OCI8.new(
-      ENV.fetch('UMT_USER'),
-      ENV.fetch('UMT_PASSWORD'),
-      ENV.fetch('UMT_SID'))
-  end
-
   def connect_ldap
     unless @ldap
       @ldap = Net::LDAP.new
-      @ldap.host = ENV.fetch('LDAP2_ITZ_HOST')
-      @ldap.port = ENV.fetch('LDAP2_ITZ_PORT')
+      @ldap.host = ENV.fetch('LDAP1_ITZ_HOST')
+      @ldap.port = ENV.fetch('LDAP1_ITZ_PORT')
       @ldap.encryption :simple_tls
-      @ldap.auth ENV.fetch('LDAP2_ITZ_USER'), ENV.fetch('LDAP2_ITZ_PASSWORD')
+      @ldap.auth ENV.fetch('LDAP1_ITZ_USER'), ENV.fetch('LDAP1_ITZ_PASSWORD')
     end
   end
 
   def cleanup_redis_db
     connect_redis
     @redis.del LDAP_CHECKSUM_SET
-    @redis.del LDAP_MAIL_SET
     @redis.del UMT_CHECKSUM_SET
-    @redis.del UMT_MAIL_SET
-    @redis.del UMT_ACCOUNT_BY_CHECKSUM_HASH
-    @redis.del UMT_ACCOUNT_BY_MAIL_HASH
   end
 
   def fetch_idm
-    connect_idm
+    idm = Idm.new
     connect_redis
 
-    records = nil
-    plsql.mail_pkg.validMailAccountList { |cursor| records = cursor.fetch_all }
+    @accounts = idm.fetch
 
-    records.each do |record|
-      checksum = build_checksum(record[0] + record[1] + record[2])
+    #binding.pry
 
-      entry = {
-        sname:     record[0],
-        gname:     record[1],
-        mail:      record[2],
-        checksum:  checksum}
-
-      @redis.hmset(
-        UMT_ACCOUNT_BY_CHECKSUM_HASH,
-        checksum,
-        entry.to_json)
-
-      @redis.hmset(
-        UMT_ACCOUNT_BY_MAIL_HASH,
-        entry[:mail],
-        entry.to_json)
-
-      @redis.sadd UMT_CHECKSUM_SET, checksum
-      @redis.sadd UMT_MAIL_SET, entry[:mail]
+    @accounts.map do |account|
+      @redis.sadd UMT_CHECKSUM_SET, account.checksum
     end
 
   end
@@ -124,32 +90,21 @@ private
 
     filter = Net::LDAP::Filter.eq 'mail','*'
     basedn = 'ou=mail,o=mlu,c=de'
-    attr = ['carLicense','mail']
+    attr = ['carLicense']
 
 
     @ldap.search(base: basedn, filter: filter, attributes: attr) do |entry|
       unless entry[:carLicense].empty?
         @redis.sadd LDAP_CHECKSUM_SET,entry[:carLicense][0]
       end
-      @redis.sadd LDAP_MAIL_SET,entry[:mail][0]
     end
   end
 
-  def write_new_entry mail
-    connect_ldap
-    connect_redis
-    entry = JSON.parse(
-      @redis.hget UMT_ACCOUNT_BY_MAIL_HASH, mail).
-      symbolize_keys
+  def write_new_entry checksum
+    account = @accounts.select{ |a| a.checksum == checksum }.first
 
-    dn = "cn=#{entry[:nkz]},ou=mail,o=mlu,c=de"
-    attributes = {
-      sn: entry[:sname],
-      givenname: entry[:gname] || "k.a.",
-      mail: entry[:mail],
-      cn: "#{entry[:gname]} #{entry[:sname]}".strip,
-      carlicense: "#{entry[:checksum]}",
-      objectClass: ["top","inetOrgPerson"]}
+    dn = "uid=#{account.checksum},ou=mail,o=mlu,c=de"
+    attributes = account.to_ldif
 
     unless @ldap.add dn: dn, attributes: attributes
       puts "Result: #{@ldap.get_operation_result.code}"
@@ -157,43 +112,21 @@ private
     end
   end
 
-  def get_account_by_checksum checksum
-    JSON.parse(
-      @redis.hget UMT_ACCOUNT_BY_CHECKSUM_HASH, checksum).
-      symbolize_keys
-  end
+  def delete_obsolete_entry checksum
+    dn = "uid=#{checksum},ou=mail,o=mlu,c=de"
 
-  def write_update_entry checksum
-    entry = get_account_by_checksum checksum
-
-    dn = "mail=#{entry[:mail]},ou=mail,o=mlu,c=de"
-
-    operations = [
-      [:replace, :givenname, entry[:gname]],
-      [:replace, :sn, entry[:sname]],
-      [:replace, :mail, entry[:mail]],
-      [:replace, :carlicense, entry[:checksum]]]
-
-    unless @ldap.modify dn: dn, operations: operations
+    unless @ldap.delete dn: dn
       puts "Result: #{@ldap.get_operation_result.code}"
       puts "Message: #{@ldap.get_operation_result.message}"
     end
   end
 
   def obsolete_entries
-    @redis.sdiff LDAP_MAIL_SET, UMT_MAIL_SET
+    @redis.sdiff LDAP_CHECKSUM_SET, UMT_CHECKSUM_SET
   end
 
   def missing_entries
-    @redis.sdiff UMT_MAIL_SET, LDAP_MAIL_SET
-  end
-
-  def update_candidates
     @redis.sdiff UMT_CHECKSUM_SET, LDAP_CHECKSUM_SET
-  end
-
-  def build_checksum string
-    Digest::SHA1.hexdigest string
   end
 end
 
